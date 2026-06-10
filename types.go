@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -11,11 +12,10 @@ const (
 
 	SolMint = "So11111111111111111111111111111111111111112"
 
-	DefaultJupiterBaseURL    = "https://api.jup.ag/swap/v2"
-	DefaultDexScreenerBase   = "https://api.dexscreener.com"
-	DefaultGeminiBaseURL     = "https://generativelanguage.googleapis.com/v1beta"
-	DefaultLocalDBPath       = "/tmp/auto-tr-ai.db"
-	DefaultDashboardTextHash = "-"
+	DefaultJupiterBaseURL  = "https://api.jup.ag/swap/v2"
+	DefaultDexScreenerBase = "https://api.dexscreener.com"
+	DefaultGeminiBaseURL   = "https://generativelanguage.googleapis.com/v1beta"
+	DefaultLocalDBPath     = "/tmp/auto-tr-ai.db"
 )
 
 type Env struct {
@@ -38,8 +38,10 @@ type App struct {
 	store  *Store
 	client *http.Client
 
-	mu           sync.Mutex
-	cfg          Config
+	mu      sync.Mutex
+	tradeMu sync.Mutex
+	cfg     Config
+
 	paused       bool
 	lastScanAt   time.Time
 	lastAction   string
@@ -47,6 +49,18 @@ type App struct {
 	candidate    *Candidate
 	position     *Position
 	updateOffset int64
+
+	scanRunning bool
+	scanSeq     uint64
+	scanCancel  context.CancelFunc
+
+	lastAIAt             time.Time
+	aiGlobalCooldownTill time.Time
+	modelCooldown        map[string]time.Time
+
+	dexLimiter     *IntervalLimiter
+	geminiLimiter  *IntervalLimiter
+	jupiterLimiter *IntervalLimiter
 }
 
 type Config struct {
@@ -61,14 +75,16 @@ type Config struct {
 	MaxDailyLossIDR  float64
 	MaxDailyTrades   int
 
-	StopLossPct          float64
-	TakeProfit1Pct       float64
-	TakeProfit1SellPct   float64
-	TakeProfit2Pct       float64
-	TrailingStartPct     float64
-	TrailingDistancePct  float64
-	MaxHoldMinutes       int
-	SlippageBps          int
+	StopLossPct         float64
+	TakeProfit1Pct      float64
+	TakeProfit1SellPct  float64
+	TakeProfit2Pct      float64
+	TrailingStartPct    float64
+	TrailingDistancePct float64
+	MaxHoldMinutes      int
+
+	SlippageBps int
+
 	ScannerIntervalSec   int
 	PositionIntervalSec  int
 	TelegramEditInterval int
@@ -76,23 +92,33 @@ type Config struct {
 	USDIDR float64
 	SOLUSD float64
 
-	ScannerMaxProfiles  int
-	MinLiquidityUSD     float64
-	MaxLiquidityUSD     float64
-	MinVolume5mUSD      float64
-	MinTxns5m           int
-	MinBuys5m           int
-	MaxSellRatio5m      float64
-	MinPairAgeMinutes   int
-	MaxPairAgeHours     int
-	MaxPriceChange5mPct float64
-	MaxPriceChange1hPct float64
-	MinScore            float64
+	ScannerMaxProfiles       int
+	MinLiquidityUSD          float64
+	MaxLiquidityUSD          float64
+	MinVolume5mUSD           float64
+	MinTxns5m                int
+	MinBuys5m                int
+	MaxSellRatio5m           float64
+	MinPairAgeMinutes        int
+	MaxPairAgeHours          int
+	MaxPriceChange5mPct      float64
+	MaxPriceChange1hPct      float64
+	MinScore                 float64
+	CandidateCooldownMinutes int
 
-	AIEnabled       bool
-	AIMinConfidence float64
-	AIModelPriority []string
-	AIModelCooldown int
+	AIEnabled                  bool
+	AIMinConfidence            float64
+	AIModelPriority            []string
+	AIModelCooldownMinutes     int
+	AIMinIntervalSeconds       int
+	AIDailyMaxCalls            int
+	AICacheTTLMinutes          int
+	AIMaxAttemptsPerAnalysis   int
+	AIRateLimitCooldownMinutes int
+
+	DexMinIntervalMS     int
+	GeminiMinIntervalMS  int
+	JupiterMinIntervalMS int
 
 	DexScreenerBaseURL string
 	GeminiBaseURL      string
@@ -122,25 +148,25 @@ type Candidate struct {
 }
 
 type Position struct {
-	ID              string
-	Mode            string
-	Mint            string
-	Symbol          string
-	EntryPriceUSD   float64
-	LastPriceUSD    float64
-	HighestPriceUSD float64
-	AmountTokenRaw  string
-	AmountTokenEst  float64
-	AmountUSD       float64
-	AmountIDR       float64
-	Status          string
-	TP1Done         bool
-	TP2Done         bool
-	EntryTx         string
-	ExitTx          string
-	OpenedAt        time.Time
-	ClosedAt        *time.Time
-	LastReason      string
+	ID               string
+	Mode             string
+	Mint             string
+	Symbol           string
+	EntryPriceUSD    float64
+	LastPriceUSD     float64
+	HighestPriceUSD  float64
+	AmountTokenRaw   string
+	AmountTokenEst   float64
+	AmountUSD        float64
+	AmountIDR        float64
+	Status           string
+	TP1Done          bool
+	TP2Done          bool
+	EntryTx          string
+	ExitTx           string
+	OpenedAt         time.Time
+	ClosedAt         *time.Time
+	LastReason       string
 }
 
 type AIResult struct {
@@ -212,48 +238,57 @@ type DexPair struct {
 	DexID       string `json:"dexId"`
 	URL         string `json:"url"`
 	PairAddress string `json:"pairAddress"`
-	BaseToken   struct {
+
+	BaseToken struct {
 		Address string `json:"address"`
 		Name    string `json:"name"`
 		Symbol  string `json:"symbol"`
 	} `json:"baseToken"`
+
 	QuoteToken struct {
 		Address string `json:"address"`
 		Name    string `json:"name"`
 		Symbol  string `json:"symbol"`
 	} `json:"quoteToken"`
+
 	PriceNative string `json:"priceNative"`
 	PriceUSD    string `json:"priceUsd"`
-	Txns        struct {
+
+	Txns struct {
 		M5 struct {
 			Buys  int `json:"buys"`
 			Sells int `json:"sells"`
 		} `json:"m5"`
+
 		H1 struct {
 			Buys  int `json:"buys"`
 			Sells int `json:"sells"`
 		} `json:"h1"`
 	} `json:"txns"`
+
 	Volume struct {
 		M5 float64 `json:"m5"`
 		H1 float64 `json:"h1"`
 	} `json:"volume"`
+
 	PriceChange struct {
 		M5 float64 `json:"m5"`
 		H1 float64 `json:"h1"`
 	} `json:"priceChange"`
+
 	Liquidity struct {
 		USD   float64 `json:"usd"`
 		Base  float64 `json:"base"`
 		Quote float64 `json:"quote"`
 	} `json:"liquidity"`
+
 	PairCreatedAt int64 `json:"pairCreatedAt"`
 }
 
 type GeminiRequest struct {
 	SystemInstruction *GeminiSystemInstruction `json:"system_instruction,omitempty"`
-	Contents          []GeminiContent          `json:"contents"`
-	GenerationConfig  GeminiGenerationConfig   `json:"generationConfig"`
+	Contents          []GeminiContent           `json:"contents"`
+	GenerationConfig  GeminiGenerationConfig    `json:"generationConfig"`
 }
 
 type GeminiSystemInstruction struct {
@@ -269,8 +304,9 @@ type GeminiPart struct {
 }
 
 type GeminiGenerationConfig struct {
-	ResponseMIMEType string  `json:"response_mime_type"`
+	ResponseMIMEType string  `json:"responseMimeType"`
 	Temperature      float64 `json:"temperature"`
+	MaxOutputTokens  int     `json:"maxOutputTokens"`
 }
 
 type GeminiResponse struct {
@@ -279,6 +315,7 @@ type GeminiResponse struct {
 			Parts []GeminiPart `json:"parts"`
 		} `json:"content"`
 	} `json:"candidates"`
+
 	Error *struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
