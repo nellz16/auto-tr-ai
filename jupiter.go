@@ -12,123 +12,272 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 )
 
-func (a *App) executeJupiterSwap(ctx context.Context, cfg Config, inputMint, outputMint, amount string) (string, string, error) {
-	pk, err := solana.PrivateKeyFromBase58(a.env.PrivateKeyBase58)
+func (a *App) executeJupiterSwap(
+	ctx context.Context,
+	cfg Config,
+	inputMint string,
+	outputMint string,
+	amount string,
+) (string, string, error) {
+	privateKey, err := solana.PrivateKeyFromBase58(
+		a.env.PrivateKeyBase58,
+	)
 	if err != nil {
 		return "", "", err
 	}
-	taker := pk.PublicKey().String()
 
-	orderURL := strings.TrimRight(cfg.JupiterBaseURL, "/") + "/order"
-	q := url.Values{}
-	q.Set("inputMint", inputMint)
-	q.Set("outputMint", outputMint)
-	q.Set("amount", amount)
-	q.Set("taker", taker)
-	q.Set("slippageBps", strconv.Itoa(cfg.SlippageBps))
+	taker := privateKey.PublicKey().String()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, orderURL+"?"+q.Encode(), nil)
-	if err != nil {
-		return "", "", err
-	}
-	req.Header.Set("x-api-key", a.env.JupiterAPIKey)
+	orderEndpoint := strings.TrimRight(
+		cfg.JupiterBaseURL,
+		"/",
+	) + "/order"
 
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return "", "", fmt.Errorf("jupiter order HTTP %d: %s", resp.StatusCode, string(body))
-	}
+	query := url.Values{}
+	query.Set("inputMint", inputMint)
+	query.Set("outputMint", outputMint)
+	query.Set("amount", amount)
+	query.Set("taker", taker)
+	query.Set(
+		"slippageBps",
+		strconv.Itoa(cfg.SlippageBps),
+	)
 
 	var order JupiterOrderResponse
-	if err := json.Unmarshal(body, &order); err != nil {
+
+	if err := a.doJupiterJSON(
+		ctx,
+		http.MethodGet,
+		orderEndpoint+"?"+query.Encode(),
+		nil,
+		&order,
+	); err != nil {
 		return "", "", err
 	}
+
 	if order.Error != "" {
 		return "", "", errors.New(order.Error)
 	}
-	if order.Transaction == "" || order.RequestID == "" {
-		return "", "", fmt.Errorf("invalid jupiter order: %s", string(body))
+
+	if order.Transaction == "" ||
+		order.RequestID == "" {
+
+		return "", "", errors.New(
+			"Jupiter order tidak memiliki transaction/requestId",
+		)
 	}
 
-	signedB64, err := signJupiterTransaction(order.Transaction, pk)
+	signedTransaction, err := signJupiterTransaction(
+		order.Transaction,
+		privateKey,
+	)
 	if err != nil {
 		return "", "", err
 	}
 
-	executeURL := strings.TrimRight(cfg.JupiterBaseURL, "/") + "/execute"
-	execPayload := map[string]string{
-		"signedTransaction": signedB64,
+	executePayload := map[string]string{
+		"signedTransaction": signedTransaction,
 		"requestId":         order.RequestID,
 	}
-	rawPayload, _ := json.Marshal(execPayload)
 
-	req2, err := http.NewRequestWithContext(ctx, http.MethodPost, executeURL, bytes.NewReader(rawPayload))
+	rawPayload, err := json.Marshal(executePayload)
 	if err != nil {
 		return "", "", err
 	}
-	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("x-api-key", a.env.JupiterAPIKey)
 
-	resp2, err := a.client.Do(req2)
-	if err != nil {
+	executeEndpoint := strings.TrimRight(
+		cfg.JupiterBaseURL,
+		"/",
+	) + "/execute"
+
+	var execution JupiterExecuteResponse
+
+	if err := a.doJupiterJSON(
+		ctx,
+		http.MethodPost,
+		executeEndpoint,
+		rawPayload,
+		&execution,
+	); err != nil {
 		return "", "", err
 	}
-	defer resp2.Body.Close()
 
-	body2, _ := io.ReadAll(resp2.Body)
-	if resp2.StatusCode >= 300 {
-		return "", "", fmt.Errorf("jupiter execute HTTP %d: %s", resp2.StatusCode, string(body2))
+	if execution.Error != "" {
+		return "", "", errors.New(execution.Error)
 	}
 
-	var ex JupiterExecuteResponse
-	if err := json.Unmarshal(body2, &ex); err != nil {
-		return "", "", err
-	}
-	if ex.Error != "" {
-		return "", "", errors.New(ex.Error)
-	}
-	if ex.Signature == "" {
-		return "", "", fmt.Errorf("empty signature: %s", string(body2))
+	if execution.Signature == "" {
+		return "", "", errors.New(
+			"Jupiter execute tidak mengembalikan signature",
+		)
 	}
 
-	return ex.Signature, order.OutAmount, nil
+	return execution.Signature, order.OutAmount, nil
 }
 
-func signJupiterTransaction(txBase64 string, pk solana.PrivateKey) (string, error) {
-	raw, err := base64.StdEncoding.DecodeString(txBase64)
-	if err != nil {
-		return "", err
-	}
+func (a *App) doJupiterJSON(
+	ctx context.Context,
+	method string,
+	endpoint string,
+	requestBody []byte,
+	output any,
+) error {
+	var lastError error
 
-	tx, err := solana.TransactionFromDecoder(bin.NewBinDecoder(raw))
-	if err != nil {
-		return "", err
-	}
-
-	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
-		if key.Equals(pk.PublicKey()) {
-			return &pk
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := a.waitJupiter(ctx); err != nil {
+			return err
 		}
-		return nil
-	})
+
+		var bodyReader *bytes.Reader
+
+		if requestBody == nil {
+			bodyReader = bytes.NewReader(nil)
+		} else {
+			bodyReader = bytes.NewReader(requestBody)
+		}
+
+		request, err := http.NewRequestWithContext(
+			ctx,
+			method,
+			endpoint,
+			bodyReader,
+		)
+		if err != nil {
+			return err
+		}
+
+		request.Header.Set(
+			"x-api-key",
+			a.env.JupiterAPIKey,
+		)
+
+		if method != http.MethodGet {
+			request.Header.Set(
+				"Content-Type",
+				"application/json",
+			)
+		}
+
+		response, err := a.client.Do(request)
+		if err != nil {
+			lastError = err
+
+			if attempt == 0 {
+				if err := sleepContext(
+					ctx,
+					2*time.Second,
+				); err != nil {
+					return err
+				}
+
+				continue
+			}
+
+			return err
+		}
+
+		responseBody, readErr := io.ReadAll(
+			response.Body,
+		)
+		response.Body.Close()
+
+		if readErr != nil {
+			return readErr
+		}
+
+		if response.StatusCode >= 200 &&
+			response.StatusCode < 300 {
+
+			if output == nil ||
+				len(responseBody) == 0 {
+
+				return nil
+			}
+
+			return json.Unmarshal(
+				responseBody,
+				output,
+			)
+		}
+
+		apiError := newAPIError(
+			"jupiter",
+			response,
+			responseBody,
+		)
+
+		lastError = apiError
+
+		if attempt == 0 &&
+			(response.StatusCode == http.StatusTooManyRequests ||
+				response.StatusCode >= 500) {
+
+			wait := apiError.RetryAfter
+
+			if wait <= 0 {
+				wait = 2 * time.Second
+			}
+
+			if err := sleepContext(
+				ctx,
+				wait,
+			); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		return apiError
+	}
+
+	return lastError
+}
+
+func signJupiterTransaction(
+	transactionBase64 string,
+	privateKey solana.PrivateKey,
+) (string, error) {
+	rawTransaction, err := base64.StdEncoding.DecodeString(
+		transactionBase64,
+	)
 	if err != nil {
 		return "", err
 	}
 
-	signed, err := tx.MarshalBinary()
+	transaction, err := solana.TransactionFromDecoder(
+		bin.NewBinDecoder(rawTransaction),
+	)
 	if err != nil {
 		return "", err
 	}
 
-	return base64.StdEncoding.EncodeToString(signed), nil
+	_, err = transaction.Sign(
+		func(publicKey solana.PublicKey) *solana.PrivateKey {
+			if publicKey.Equals(privateKey.PublicKey()) {
+				return &privateKey
+			}
+
+			return nil
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+
+	signedBinary, err := transaction.MarshalBinary()
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(
+		signedBinary,
+	), nil
 }
