@@ -148,25 +148,25 @@ type Candidate struct {
 }
 
 type Position struct {
-	ID               string
-	Mode             string
-	Mint             string
-	Symbol           string
-	EntryPriceUSD    float64
-	LastPriceUSD     float64
-	HighestPriceUSD  float64
-	AmountTokenRaw   string
-	AmountTokenEst   float64
-	AmountUSD        float64
-	AmountIDR        float64
-	Status           string
-	TP1Done          bool
-	TP2Done          bool
-	EntryTx          string
-	ExitTx           string
-	OpenedAt         time.Time
-	ClosedAt         *time.Time
-	LastReason       string
+	ID              string
+	Mode            string
+	Mint            string
+	Symbol          string
+	EntryPriceUSD   float64
+	LastPriceUSD    float64
+	HighestPriceUSD float64
+	AmountTokenRaw  string
+	AmountTokenEst  float64
+	AmountUSD       float64
+	AmountIDR       float64
+	Status          string
+	TP1Done         bool
+	TP2Done         bool
+	EntryTx         string
+	ExitTx          string
+	OpenedAt        time.Time
+	ClosedAt        *time.Time
+	LastReason      string
 }
 
 type AIResult struct {
@@ -287,8 +287,8 @@ type DexPair struct {
 
 type GeminiRequest struct {
 	SystemInstruction *GeminiSystemInstruction `json:"system_instruction,omitempty"`
-	Contents          []GeminiContent           `json:"contents"`
-	GenerationConfig  GeminiGenerationConfig    `json:"generationConfig"`
+	Contents          []GeminiContent          `json:"contents"`
+	GenerationConfig  GeminiGenerationConfig   `json:"generationConfig"`
 }
 
 type GeminiSystemInstruction struct {
